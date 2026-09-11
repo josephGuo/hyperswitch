@@ -7421,6 +7421,13 @@ pub struct GooglePayTokenDecryptor {
     root_signing_keys: Vec<GooglePayRootSigningKey>,
     recipient_id: hyperswitch_masking::Secret<String>,
     private_key: PKey<openssl::pkey::Private>,
+    /// Tokenization type the merchant configured on its MCA. `INTERNAL_GATEWAY` tokens get the
+    /// additional `gatewayMerchantId` check after decryption; every other type keeps today's
+    /// behaviour.
+    tokenization_type: api_models::payments::GooglePayTokenizationType,
+    /// Hyperswitch merchant id that was sent to Google as `gateway_merchant_id`. Set for
+    /// `INTERNAL_GATEWAY` only, and checked against the decrypted token.
+    gateway_merchant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -7528,6 +7535,8 @@ impl GooglePayTokenDecryptor {
         root_keys: hyperswitch_masking::Secret<String>,
         recipient_id: hyperswitch_masking::Secret<String>,
         private_key: hyperswitch_masking::Secret<String>,
+        tokenization_type: api_models::payments::GooglePayTokenizationType,
+        gateway_merchant_id: Option<String>,
     ) -> CustomResult<Self, errors::GooglePayDecryptionError> {
         // base64 decode the private key
         let decoded_key = BASE64_ENGINE
@@ -7554,6 +7563,8 @@ impl GooglePayTokenDecryptor {
             root_signing_keys: filtered_root_signing_keys,
             recipient_id,
             private_key,
+            tokenization_type,
+            gateway_merchant_id,
         })
     }
 
@@ -7571,7 +7582,6 @@ impl GooglePayTokenDecryptor {
             .parse_struct("EncryptedData")
             .change_context(errors::GooglePayDecryptionError::DeserializationFailed)?;
 
-        // verify the signature if required
         if should_verify_signature {
             self.verify_signature(&encrypted_data)?;
         }
@@ -7601,6 +7611,16 @@ impl GooglePayTokenDecryptor {
                 .parse_struct("GooglePayPredecryptDataInternal")
                 .change_context(errors::GooglePayDecryptionError::DeserializationFailed)?;
 
+        // `gatewayMerchantId` only exists once the message is decrypted, so this half of the
+        // INTERNAL_GATEWAY verification necessarily runs here rather than alongside the signature
+        // checks above.
+        if matches!(
+            self.tokenization_type,
+            api_models::payments::GooglePayTokenizationType::InternalGateway
+        ) {
+            self.verify_internal_gateway_merchant_id(&decrypted_data)?;
+        }
+
         // check the expiration date of the decrypted data
 
         if matches!(
@@ -7613,6 +7633,44 @@ impl GooglePayTokenDecryptor {
         }
     }
 
+    /// Check that the decrypted token was minted for the merchant now being paid.
+    ///
+    /// Under `INTERNAL_GATEWAY` every merchant's card is encrypted to the same gateway key, so the
+    /// key alone no longer separates one merchant from another. `gateway_merchant_id` is what
+    /// does: Google echoes back the Hyperswitch merchant id that was sent in the session response,
+    /// and a mismatch means the token belongs to a different merchant's payment.
+    fn verify_internal_gateway_merchant_id(
+        &self,
+        decrypted_data: &hyperswitch_domain_models::router_data::GooglePayPredecryptDataInternal,
+    ) -> CustomResult<(), errors::GooglePayDecryptionError> {
+        let expected_gateway_merchant_id = self
+            .gateway_merchant_id
+            .as_ref()
+            .ok_or(errors::GooglePayDecryptionError::InvalidGatewayMerchantId)
+            .attach_printable(
+                "gateway merchant id is not set on the decryptor for an INTERNAL_GATEWAY token",
+            )?;
+
+        let token_gateway_merchant_id = decrypted_data
+            .gateway_merchant_id
+            .as_ref()
+            .ok_or(errors::GooglePayDecryptionError::InvalidGatewayMerchantId)
+            .attach_printable(
+                "decrypted INTERNAL_GATEWAY token does not carry a gateway merchant id",
+            )?;
+
+        if token_gateway_merchant_id != expected_gateway_merchant_id {
+            logger::warn!(
+                expected_gateway_merchant_id,
+                token_gateway_merchant_id,
+                "gateway merchant id in the token does not match the merchant"
+            );
+            Err(errors::GooglePayDecryptionError::InvalidGatewayMerchantId)
+                .attach_printable("gateway merchant id in the token does not match the merchant")?;
+        }
+
+        Ok(())
+    }
     // Verify the signature of the token
     fn verify_signature(
         &self,
@@ -9592,7 +9650,10 @@ pub fn validate_platform_request_for_marketplace(
 
 /// Returns `true` if either the org or merchant config is set to "true"
 ///
-/// Priority logic:
+/// Resolved from Superposition (`SHOULD_ENABLE_AUTHENTICATION_SERVICE`), falling back to the
+/// legacy DB config (`authentication_service_eligible_<id>`) when Superposition has no value.
+///
+/// Priority logic (DB fallback order, see `ShouldEnableAuthenticationService::db_keys`):
 /// 1. If org-level config exists (either "true" or "false"), that decision is final
 ///    - Org = "true" → returns true (authentication enabled)
 ///    - Org = "false" → returns false (authentication disabled, merchant config ignored)
@@ -9605,35 +9666,19 @@ pub async fn is_merchant_eligible_authentication_service(
     processor: &domain::Processor,
     state: &SessionState,
 ) -> RouterResult<bool> {
-    let db = &*state.store;
-    let org_key = processor
-        .get_account()
-        .get_org_id()
-        .get_authentication_service_eligible_key();
-    let org_eligible = db
-        .find_config_by_key(&org_key)
-        .await
-        .inspect_err(|error| {
-            logger::error!(?error, "Failed to fetch `{org_key}` config from DB");
-        })
-        .ok()
-        .map(|c| c.config.to_lowercase() == "true");
+    let dimensions = dimension_state::Dimensions::new()
+        .with_processor_merchant_id(processor.get_processor_merchant_id())
+        .with_provider_merchant_id(dimension_state::ProviderMerchantId::new(
+            processor.get_account().get_id().clone(),
+        ))
+        .with_organization_id(processor.get_account().get_org_id().clone());
 
-    Ok(org_eligible
-        .async_unwrap_or_else(|| async {
-            let merchant_key = processor
-                .get_account()
-                .get_id()
-                .get_authentication_service_eligible_key();
-            db.find_config_by_key(&merchant_key)
-                .await
-                .inspect_err(|error| {
-                    logger::error!(?error, "Failed to fetch `{merchant_key}` config from DB");
-                })
-                .ok()
-                .map(|c| c.config.to_lowercase() == "true")
-                .unwrap_or(false)
-        })
+    Ok(dimensions
+        .get_should_enable_authentication_service(
+            state.store.as_ref(),
+            state.superposition_service.as_ref(),
+            None,
+        )
         .await)
 }
 
@@ -9777,6 +9822,25 @@ pub async fn get_merchant_connector_account_v2(
         })
         .attach_printable("merchant_connector_id is not provided"),
     }
+}
+
+#[cfg(feature = "v1")]
+pub fn is_off_session_mit_for_payment_method(
+    req: &api::PaymentsRequest,
+    payment_method_id: &str,
+) -> bool {
+    req.confirm == Some(true)
+        && req.off_session == Some(true)
+        && req
+            .recurring_details
+            .as_ref()
+            .is_some_and(|recurring_details| {
+                matches!(
+                    recurring_details,
+                    RecurringDetails::PaymentMethodId(recurring_payment_method_id)
+                        if recurring_payment_method_id.as_str() == payment_method_id
+                )
+            })
 }
 
 pub fn is_stored_credential(
