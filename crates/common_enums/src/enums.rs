@@ -10,6 +10,7 @@ use std::{
 
 pub use accounts::{
     MerchantAccountRequestType, MerchantAccountType, MerchantProductType, OrganizationType,
+    ResourceRequestorType, ResourceType,
 };
 use diesel::{
     backend::Backend,
@@ -9664,6 +9665,7 @@ pub enum ParentGroup {
 #[serde(rename_all = "snake_case")]
 pub enum Resource {
     Payment,
+    PaymentLink,
     Refund,
     ApiKey,
     Account,
