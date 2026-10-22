@@ -1199,10 +1199,21 @@ impl<F: Clone + Send + Sync> Domain<F, api::PaymentsRequest, PaymentData<F>> for
                                 .as_ref()
                                 .and_then(|pmd| pmd.payment_method_data.as_ref())
                             {
-                                Some(api_models::payments::PaymentMethodData::Wallet(_)) => {
-                                    req.setup_future_usage
-                                        .or(payment_data.payment_intent.setup_future_usage)
-                                        == Some(common_enums::FutureUsage::OffSession)
+                                Some(api_models::payments::PaymentMethodData::Wallet(
+                                    wallet_data,
+                                )) => {
+                                    let payment_method_token =
+                                        payment_data.get_payment_method_token().cloned();
+                                    let is_decrypted_flow = payment_method_token
+                                        .map(|pmt| pmt.is_decrypted_flow())
+                                        .unwrap_or(false)
+                                        || wallet_data.is_decrypted_flow();
+
+                                    is_decrypted_flow
+                                        || req
+                                            .setup_future_usage
+                                            .or(payment_data.payment_intent.setup_future_usage)
+                                            == Some(common_enums::FutureUsage::OffSession)
                                 }
                                 Some(api_models::payments::PaymentMethodData::Card(_))
                                 | Some(api_models::payments::PaymentMethodData::CardWithNoCVC(_))
@@ -2644,8 +2655,18 @@ impl PaymentConfirm {
         .await?;
         logger::info!("Payment method fetched from PM Modular Service.");
 
+        // The customer id in the request can be the `merchant_reference_id` of the customer, while
+        // the payment method holds the id of the customer record.
+        let request_customer_id = match req.get_customer_id() {
+            Some(customer_id) => Some(
+                helpers::resolve_request_customer_id(state, platform.get_provider(), customer_id)
+                    .await,
+            ),
+            None => None,
+        };
+
         utils::when(
-            req.get_customer_id().is_some_and(|customer_id| {
+            request_customer_id.as_ref().is_some_and(|customer_id| {
                 pm_info.payment_method.customer_id.as_ref() != Some(customer_id)
             }),
             || {
