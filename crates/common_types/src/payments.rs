@@ -1135,9 +1135,11 @@ pub enum RecoveryNoRetryReason {
     /// The invoice has used every retry it is allowed.
     RetriesExhausted,
     /// The grace period of the invoice is over, or would be over by the time of the next retry.
-    GracePeriodExceeded,
+    #[serde(alias = "grace_period_exceeded")]
+    GracePeriodExpired,
     /// The card was hard declined, and the retries the profile allows after that are used up.
-    HardDecline,
+    #[serde(alias = "hard_decline")]
+    HardDeclined,
     /// The retry algorithm of the profile is `monitoring`, so transactions are only recorded.
     Monitoring,
     /// The invoice is cancelled.
@@ -1188,10 +1190,6 @@ impl RecoveryNextRetry {
 /// job holds it between the merchant's reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ExternalTriggerState {
-    /// Standardised error code of the last failed transaction. The result of the next retry is
-    /// counted against it in the cluster data.
-    #[schema(value_type = Option<StandardisedCode>)]
-    pub last_failure_code: Option<common_enums::StandardisedCode>,
     /// Positions of the static retry ladder the invoice has used.
     pub consumed_ladder_rungs: u32,
     /// Retries made with the card of the invoice since it was first hard declined. Absent while it
